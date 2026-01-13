@@ -1,0 +1,207 @@
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ai-reco-data
+  namespace: aiops
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 1Gi
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: ai-reco-app
+  namespace: aiops
+data:
+  main.py: |
+    import os, json, time, sqlite3, re
+    from typing import Any, Dict
+    from fastapi import FastAPI
+    from fastapi.responses import PlainTextResponse
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+    from openai import OpenAI
+
+    client = OpenAI()  # uses OPENAI_API_KEY from env
+
+    DB_PATH = os.getenv("DB_PATH", "/data/aiops.db")
+    RUNBOOKS_PATH = os.getenv("RUNBOOKS_PATH", "/data/runbooks.txt")
+
+    REQ_TOTAL = Counter("aiops_reco_requests_total", "Total recommendation requests", ["status"])
+    LAT = Histogram("aiops_reco_request_latency_seconds", "Recommendation latency (seconds)")
+    OPENAI_TOTAL = Counter("aiops_reco_openai_calls_total", "OpenAI calls", ["status"])
+
+    app = FastAPI(title="AIOps Recommendation API")
+
+    def db():
+      os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+      conn = sqlite3.connect(DB_PATH)
+      conn.execute("""
+        CREATE TABLE IF NOT EXISTS recommendations (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          ts INTEGER,
+          alertname TEXT,
+          severity TEXT,
+          namespace TEXT,
+          summary TEXT,
+          recommendation TEXT,
+          raw_json TEXT
+        )
+      """)
+      conn.commit()
+      return conn
+
+    def load_runbooks() -> str:
+      return open(RUNBOOKS_PATH, "r", encoding="utf-8").read() if os.path.exists(RUNBOOKS_PATH) else ""
+
+    def retrieve(runbooks: str, q: str, max_chars: int = 2000) -> str:
+      qtok = set(re.findall(r"[a-z0-9]+", q.lower()))
+      best, best_score = "", 0
+      for chunk in runbooks.split("\n\n"):
+        ctok = set(re.findall(r"[a-z0-9]+", chunk.lower()))
+        score = len(qtok & ctok)
+        if score > best_score:
+          best, best_score = chunk, score
+      return best[:max_chars] if best else ""
+
+    def extract(payload: Dict[str, Any]) -> Dict[str, str]:
+      alerts = payload.get("alerts") or []
+      a = alerts[0] if alerts else {}
+      labels = a.get("labels") or {}
+      ann = a.get("annotations") or {}
+      return {
+        "alertname": labels.get("alertname", "unknown"),
+        "severity": labels.get("severity", "unknown"),
+        "namespace": labels.get("namespace", labels.get("kubernetes_namespace", "unknown")),
+        "summary": (ann.get("summary") or ann.get("description") or "")[:500],
+      }
+
+    @app.get("/healthz")
+    def healthz():
+      return {"ok": True}
+
+    @app.get("/metrics")
+    def metrics():
+      return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+    @app.post("/recommend")
+    def recommend(payload: Dict[str, Any]):
+      t0 = time.time()
+      try:
+        info = extract(payload)
+        runbooks = load_runbooks()
+        ctx = retrieve(runbooks, f"{info['alertname']} {info['summary']} {info['namespace']} {info['severity']}")
+
+        system = (
+          "You are a Kubernetes SRE assistant. Provide safe, step-by-step troubleshooting guidance. "
+          "No self-healing actions. Include kubectl commands and what to validate in Prometheus/Grafana."
+        )
+        user = f"""Alert:
+- alertname: {info['alertname']}
+- severity: {info['severity']}
+- namespace: {info['namespace']}
+- summary: {info['summary']}
+
+Runbook context:
+{ctx if ctx else "(no matching runbook snippet)"}
+
+Return:
+1) Probable cause
+2) Immediate checks (commands)
+3) Mitigation steps
+4) What confirms recovery
+"""
+
+        model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        try:
+          resp = client.responses.create(model=model, instructions=system, input=user)
+          text = resp.output_text
+          OPENAI_TOTAL.labels("success").inc()
+        except Exception as e:
+          text = f"OpenAI call failed: {e}"
+          OPENAI_TOTAL.labels("error").inc()
+
+        conn = db()
+        conn.execute(
+          "INSERT INTO recommendations(ts, alertname, severity, namespace, summary, recommendation, raw_json) VALUES(?,?,?,?,?,?,?)",
+          (int(time.time()), info["alertname"], info["severity"], info["namespace"], info["summary"], text, json.dumps(payload)[:200000]),
+        )
+        conn.commit()
+        conn.close()
+
+        REQ_TOTAL.labels("success").inc()
+        LAT.observe(time.time() - t0)
+        return {"alert": info, "recommendation": text}
+
+      except Exception as e:
+        REQ_TOTAL.labels("error").inc()
+        LAT.observe(time.time() - t0)
+        return {"error": str(e)}
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-reco
+  namespace: aiops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-reco
+  template:
+    metadata:
+      labels:
+        app: ai-reco
+    spec:
+      containers:
+        - name: api
+          image: python:3.12-slim
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: ai-reco-openai
+          env:
+            - name: DB_PATH
+              value: /data/aiops.db
+            - name: RUNBOOKS_PATH
+              value: /data/runbooks.txt
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: data
+              mountPath: /data
+          command: ["/bin/sh", "-lc"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn prometheus-client openai && \
+              cp /app/main.py /tmp/main.py && \
+              if [ ! -f /data/runbooks.txt ]; then echo "Paste runbooks here (blank line between topics)." > /data/runbooks.txt; fi && \
+              uvicorn main:app --app-dir /tmp --host 0.0.0.0 --port 8080
+      volumes:
+        - name: app
+          configMap:
+            name: ai-reco-app
+        - name: data
+          persistentVolumeClaim:
+            claimName: ai-reco-data
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-reco
+  namespace: aiops
+  labels:
+    app: ai-reco
+spec:
+  selector:
+    app: ai-reco
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http

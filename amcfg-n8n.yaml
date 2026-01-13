@@ -1,0 +1,25 @@
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: AlertmanagerConfig
+metadata:
+  name: aiops-global-webhook
+  namespace: monitoring
+spec:
+  route:
+    receiver: n8n-webhook
+    groupBy: ["alertname","namespace","severity"]
+    groupWait: 10s
+    groupInterval: 2m
+    repeatInterval: 1h
+  receivers:
+    - name: n8n-webhook
+      webhookConfigs:
+        - url: "http://n8n-svc.aiops.svc.cluster.local:5678/webhook/alertmanager"
+          sendResolved: true
+          httpConfig:
+            basicAuth:
+              username:
+                name: n8n-webhook-basic-auth
+                key: username
+              password:
+                name: n8n-webhook-basic-auth
+                key: password

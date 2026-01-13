@@ -1,0 +1,18 @@
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: aiops-badpod-rules
+  namespace: monitoring
+  labels:
+    release: monitoring   # must match your kube-prometheus-stack release name
+spec:
+  groups:
+  - name: aiops.rules
+    rules:
+    - alert: PodCrashLoop
+      expr: kube_pod_container_status_waiting_reason{reason="CrashLoopBackOff",namespace="ai-test",pod="badpod"} == 1
+      for: 1m
+      labels:
+        severity: warning
+      annotations:
+        summary: "badpod is crashing"

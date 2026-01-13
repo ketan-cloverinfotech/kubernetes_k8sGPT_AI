@@ -1,0 +1,62 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ai-reco
+  namespace: aiops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ai-reco
+  template:
+    metadata:
+      labels:
+        app: ai-reco
+    spec:
+      containers:
+        - name: api
+          image: python:3.12-slim
+          ports:
+            - name: http
+              containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: ai-reco-openai
+          env:
+            - name: DB_PATH
+              value: /data/aiops.db
+            - name: RUNBOOKS_PATH
+              value: /data/runbooks.txt
+          volumeMounts:
+            - name: app
+              mountPath: /app
+            - name: data
+              mountPath: /data
+          command: ["/bin/sh","-lc"]
+          args:
+            - |
+              pip install --no-cache-dir fastapi uvicorn prometheus-client openai && \
+              if [ ! -f /data/runbooks.txt ]; then echo "Paste runbooks here (blank line between topics)." > /data/runbooks.txt; fi && \
+              uvicorn main:app --app-dir /app --host 0.0.0.0 --port 8080
+      volumes:
+        - name: app
+          configMap:
+            name: ai-reco-app
+        - name: data
+          persistentVolumeClaim:
+            claimName: ai-reco-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ai-reco
+  namespace: aiops
+  labels:
+    app: ai-reco
+spec:
+  selector:
+    app: ai-reco
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
